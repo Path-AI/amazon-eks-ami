@@ -42,12 +42,12 @@ EOF
 ################################################################################
 
 # Enable forwarding via iptables
-sudo bash -c "/sbin/iptables-save > /etc/sysconfig/iptables"
+# sudo bash -c "/sbin/iptables-save > /etc/sysconfig/iptables"
 
-sudo mv $TEMPLATE_DIR/iptables-restore.service /etc/systemd/system/iptables-restore.service
+# sudo mv $TEMPLATE_DIR/iptables-restore.service /etc/systemd/system/iptables-restore.service
 
-sudo systemctl daemon-reload
-sudo systemctl enable iptables-restore
+# sudo systemctl daemon-reload
+# sudo systemctl enable iptables-restore
 
 ################################################################################
 ### Docker #####################################################################
