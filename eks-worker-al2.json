@@ -36,7 +36,7 @@
         {
           "device_name": "/dev/xvda",
           "volume_type": "gp2",
-          "volume_size": 4,
+          "volume_size": 20,
           "delete_on_termination": true
         }
       ],
@@ -88,6 +88,19 @@
         "DOCKER_VERSION={{user `docker_version`}}",
         "CNI_VERSION={{user `cni_version`}}",
         "CNI_PLUGIN_VERSION={{user `cni_plugin_version`}}"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": ["sudo shutdown -r now"],
+      "expect_disconnect": true
+    },
+    {
+      "pause_before": "30s",
+      "type": "shell",
+      "script": "prepare-worker.sh",
+      "environment_vars": [
+        "INSTANCE_TYPE={{user `instance_type`}}"
       ]
     }
   ],
