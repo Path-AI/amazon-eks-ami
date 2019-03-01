@@ -52,6 +52,7 @@
       "ssh_pty": true,
       "encrypt_boot": "{{user `encrypted`}}",
       "kms_key_id": "{{user `kms_key_id`}}",
+      "subnet_id": "{{user `subnet_id`}}",
       "run_tags": {
           "creator": "{{user `creator`}}"
       },
