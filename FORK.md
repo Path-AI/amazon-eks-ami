@@ -4,3 +4,4 @@ PathAI has made the following changes to this repository:
 - Reboots new instances and runs the custom `prepare-worker.sh` script.
 - Timestamp AMI names.
 - Specify an appropriate subnet for building.
+- Prevent the deletion of TEMPLATE_DIR for post processing.

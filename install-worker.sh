@@ -173,7 +173,6 @@ sudo chown root:root /etc/eks/*
 # Clean up yum caches to reduce the image size
 sudo yum clean all
 sudo rm -rf \
-    $TEMPLATE_DIR  \
     /var/cache/yum
 
 # Clean up files to reduce confusion during debug
