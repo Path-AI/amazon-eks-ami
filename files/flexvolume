@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+
+import argparse
+import botocore
+import datetime
+import json
+import os
+import psutil
+import string
+import subprocess
+import sys
+import time
+import traceback
+
+import boto3
+import requests
+
+
+"""
+This file should be placed in
+/usr/libexec/kubernetes/kubelet-plugins/volume/exec/mle.pathai.com~flexvolume/
+to enable usage of Kubernetes volume driver: mle.pathai.com/flexvolume
+
+Prequisites:
+    - gcc python3-devel python3
+    - pip3 install boto3 botocore psutil requests
+"""
+
+
+class VolumeManager(object):
+    ML_ENVIRONMENT_TAG = 'ml-environment'
+    MLE_DEPLOYMENT_TAG = 'mle-deployment'
+
+    @property
+    def ec2(self):
+        if not hasattr(self, '_ec2'):
+            self._ec2 = boto3.client('ec2', region_name='us-east-1')
+        return self._ec2
+
+    def _volume_tags(self, env_name, deployment_tag):
+        return [
+            # Some redundancy here in the tags but the idea is that
+            # ml-environment and mle-deployment are more readily machine-readable
+            # and Name is human-readable
+            {'Key': 'Name', 'Value': '%s/mlenv/%s' % (deployment_tag, env_name)},
+            {'Key': self.ML_ENVIRONMENT_TAG, 'Value': env_name},
+            {'Key': self.MLE_DEPLOYMENT_TAG, 'Value': deployment_tag}
+        ]
+
+    def _get_instance_id(self):
+        return requests.get('http://169.254.169.254/latest/meta-data/instance-id').text
+
+    def _get_volume_devices(self, instance_id):
+        """Returns of mapping of attached volume IDs and their device.
+
+        Args:
+            instance_id (str): AWS instance ID
+
+        Returns:
+            (dict): Dictionary of volume ID to the device it's attached to.
+        """
+        volume_devices = {}
+        volumes = self.ec2.describe_volumes(
+            Filters=[{'Name': 'attachment.instance-id', 'Values': [instance_id]}])['Volumes']
+        for volume in volumes:
+            attachments = volume.get('Attachments', [])
+            if len(attachments) > 0:
+                volume_devices[volume['VolumeId']] = attachments[0]['Device']
+
+        return volume_devices
+
+    def _assign_new_volume_device(self, instance_id):
+        """Find an available device name on the instance.
+
+        Args:
+            instance_id (str): AWS instance ID
+
+        Returns:
+            (str): Available device name
+        """
+        occupied_devices = self._get_volume_devices(instance_id).values()
+
+        for c in string.ascii_lowercase:
+            device_name = '/dev/xvdb' + c
+            if device_name not in occupied_devices:
+                return device_name
+
+        raise ValueError('No device names available on instance %s' % instance_id)
+
+    def _wait_for_attachment_state(self, volume_id, target_state, allowed_states, timeout):
+        """Poll volume until state reaches the target state
+
+        Args:
+            volume_id (str): AWS Volume ID
+            target_state (str): A valid value forr volume.attachment.state
+            allowed_states (str): Anything outside of this list will result in an exception
+            timeout (int): Fail if polling reaches this timeout
+
+        Returns:
+            bool: Whether the volume reached the target state
+        """
+        import datetime
+
+        def get_state():
+            attachments = self.ec2.describe_volumes(VolumeIds=[volume_id])['Volumes'][0].get('Attachments', [])
+            if len(attachments) > 0:
+                state = attachments[0]['State']
+                return state
+
+        start_time = datetime.datetime.now()
+        state = get_state()
+        first_time = True
+        while state != target_state:
+            if first_time:
+                if target_state is not None:
+                    _debug('Waiting for volume %s to enter state "%s".' % (volume_id, target_state))
+                else:
+                    _debug('Waiting for volume %s to detach.' % (volume_id))
+                first_time = False
+            else:
+                _debug('...' + str(state))
+
+            if state not in (allowed_states):
+                raise ValueError('Unexpected state "%s" for volume %s.' % (state, volume_id))
+            time.sleep(2)
+            if (datetime.datetime.now() - start_time).total_seconds() > timeout:
+                return False
+            state = get_state()
+        return True
+
+    def _get_mounted_device(self, mount_location):
+        """Because the unmount command does accept any user parameters, we have to figure out which device
+        is mounted on the specified mount location
+
+        Args:
+            mount_location (str): Kubernetes-provided mount location
+
+        Returns:
+            (str or None): Devices on this mount location
+        """
+        for partition in psutil.disk_partitions():
+            if partition.mountpoint == mount_location:
+                return partition.device
+
+        raise ValueError('No device found on mount location {}'.format(mount_location))
+
+    def _get_volume_id(self, mount_location=None, environment_name=None, snapshot_id=None):
+        """Gets a volume ID based on mount location or environment name. Mount location will be passed through
+        the unmount command, where we have to figure out volume ID using only the mount location. Environment
+        name is passed in through user parameters in the mount command, which we can use to find the volume
+        ID using its volume tags.
+
+        Args:
+            mount_location (str): Kubernetes-provided mount location
+            environment_name (str): MLE environment name
+
+        Returns:
+            str or None: AWS volume ID
+        """
+        if mount_location:
+            device = self._get_mounted_device(mount_location)
+            _debug('Device {} found for mount location {}'.format(device, mount_location))
+
+        instance_id = self._get_instance_id()
+        filters = []
+        if mount_location:
+            filters.append({'Name': 'attachment.instance-id', 'Values': [instance_id]})
+        if environment_name:
+            filters.append({'Name': 'tag:{}'.format(self.ML_ENVIRONMENT_TAG), 'Values': [environment_name]})
+        if snapshot_id:
+            filters.append({'Name': 'snapshot-id', 'Values': [snapshot_id]})
+
+        volumes = self.ec2.describe_volumes(Filters=filters)['Volumes']
+
+        for volume in volumes:
+            if environment_name:
+                return volume['VolumeId']
+            for attachment in volume.get('Attachments', []):
+                symlink_device = os.path.realpath(attachment['Device'])
+                if mount_location and symlink_device == device:
+                    return attachment['VolumeId']
+
+    def _get_volume_tags(self, volume_id):
+        """Get the environment name from the volume's tags
+
+        Args:
+            volume_id (str): Filter AWS for the volume with this ID
+
+        Returns:
+            str: Environment name
+        """
+        volume = self.ec2.describe_volumes(VolumeIds=[volume_id])['Volumes'][0]
+        if 'Tags' not in volume:
+            raise ValueError('No tags for volume {}'.format(volume_id))
+
+        tags = {}
+        for tag in volume['Tags']:
+            tags[tag['Key']] = tag.get('Value')
+
+        if not set(['Name', self.ML_ENVIRONMENT_TAG, self.MLE_DEPLOYMENT_TAG]).issubset(tags.keys()):
+            raise ValueError('Missing tags: {}'.format(tags))
+
+        return tags
+
+    def create_volume(self, instance_id, env_name, iops, storage, deployment_tag, snapshot_id=None):
+        """Create volume in the specified instance's availability zone. Generate tags from env_name.
+        Configure with iops and storage, however, if snapshot_id is specified, the volume will be loaded
+        from that snapshot and override the `storage` parameter with the snapshot's capacity.
+
+        Args:
+            instance_id (str): Create the volume in this instance's availability zone
+            env_name (str): Environment name added to volume tags
+            iops (int): Number of I/O operations per second to provision
+            storage (int): Size of the volume (overrided by snapshot capacity)
+            snapshot_id (str): Load volume from this snapshot
+
+        Returns:
+            str: Volume ID
+        """
+        ec2 = boto3.client('ec2', region_name='us-east-1')
+        instance = ec2.describe_instances(InstanceIds=[instance_id])
+        zone = instance['Reservations'][0]['Instances'][0]['Placement']['AvailabilityZone']
+        kwargs = dict(AvailabilityZone=zone,
+                      Encrypted=True,
+                      Iops=iops,
+                      Size=storage,
+                      VolumeType='io1',
+                      TagSpecifications=[
+                          {
+                              'ResourceType': 'volume',
+                              'Tags': self._volume_tags(env_name, deployment_tag)
+                          }
+                      ])
+        if snapshot_id is not None:
+            kwargs = dict(kwargs, SnapshotId=snapshot_id)
+        resp = ec2.create_volume(**kwargs)
+        volume_id = resp['VolumeId']
+        while resp['State'] == 'creating':
+            time.sleep(.5)
+            resp = self.ec2.describe_volumes(VolumeIds=[volume_id])['Volumes'][0]
+        return volume_id
+
+    def create_snapshot(self, volume_id):
+        """Create snapshot from the specified volume, with an environment tag
+
+        Args:
+            volume_id (str): AWS volume ID
+        """
+        volume_tags = self._get_volume_tags(volume_id)
+        resp = self.ec2.create_snapshot(VolumeId=volume_id)
+        snapshot_id = resp['SnapshotId']
+
+        self.ec2.create_tags(
+            Resources=[snapshot_id],
+            Tags=self._volume_tags(volume_tags[self.ML_ENVIRONMENT_TAG], volume_tags[self.MLE_DEPLOYMENT_TAG])
+        )
+
+        _debug('Created and tagged snapshot {}'.format(snapshot_id))
+
+    def attach_volume(self, instance_id, volume_id, mount_point):
+        """Attach a volume to an instance, create a filesystem, and mount to the specified location.
+        This function waits until the attachment succeeds before returning.
+
+        Args:
+            instance_id (str): Instance to attach the volume to
+            volume_id (str): Volume to attach to the instance
+            mount_point (str): Create this directory and mount the volume to this location
+
+        Returns:
+            str: Mount point
+        """
+        volume_devices = self._get_volume_devices(instance_id)
+        if volume_devices and volume_id in volume_devices:
+            device_name = volume_devices[volume_id]
+            _debug('{} already on device {}'.format(volume_id, device_name))
+        else:
+            device_name = self._assign_new_volume_device(instance_id)
+            _debug('Assigning new device {}'.format(device_name))
+
+        try:
+            self.ec2.attach_volume(InstanceId=instance_id, VolumeId=volume_id, Device=device_name)
+
+            if not self._wait_for_attachment_state(volume_id, 'attached', set(['attaching', None]), 300):
+                raise ValueError('Timeout waiting for volume %s to attach.' % volume_id)
+
+            _debug('Volume {} attached to device {}'.format(volume_id, device_name))
+        except botocore.exceptions.ClientError as e:
+            # The volume may already be attached if this function is retried.
+            if e.response['Error']['Code'] == 'VolumeInUse':
+                _debug('Volume {} is already attached'.format(volume_id))
+            else:
+                raise e
+
+        # Format file system conditionally
+        try:
+            exit_code = subprocess.call(
+                'blkid {}'.format(device_name),
+                shell=True,
+                stderr=subprocess.STDOUT
+            )
+            if exit_code != 0:
+                _debug('Creating filesystem on {}'.format(device_name))
+                subprocess.check_output(
+                    'mkfs -t ext4 {}'.format(device_name),
+                    shell=True,
+                    stderr=subprocess.STDOUT
+                )
+            else:
+                _debug('Filesystem already exists on {}'.format(device_name))
+
+            # Mount file system. We also run resize2fs routinely just in case size changed
+            subprocess.check_output(
+                'mkdir -p {} && mount {} {} && resize2fs {} && chown ec2-user:ec2-user {}'.format(
+                    mount_point,
+                    device_name,
+                    mount_point,
+                    device_name,
+                    mount_point
+                ),
+                shell=True,
+                stderr=subprocess.STDOUT
+            )
+        except subprocess.CalledProcessError as e:
+            _debug(e.output)
+            raise e
+
+        return mount_point
+
+    def detach_volume(self, mount_location):
+        """Unmounts and detaches an AWS volume from this mount location.
+
+        Args:
+            mount_location (str): Kubernetes-provided mount location, corresponds with a pod's volume mount
+
+        Returns:
+            (str or None): Detached AWS volume ID, if a volume was found on this mount location.
+        """
+        volume_id = self._get_volume_id(mount_location=mount_location)
+        if not volume_id:
+            _debug('No volume found for mount location {}'.format(mount_location))
+            return
+
+        subprocess.check_output('umount {}'.format(mount_location), shell=True, stderr=subprocess.STDOUT)
+        self.ec2.detach_volume(VolumeId=volume_id)
+        if not self._wait_for_attachment_state(volume_id, None, set(['attached', 'detaching', 'busy']), 60):
+            _debug('Timed out waiting for volume %s to detach, will try force detach.' % volume_id)
+            try:
+                self.ec2.detach_volume(VolumeId=volume_id, Force=True)
+            except botocore.exceptions.ClientError:
+                pass
+            if not self._wait_for_attachment_state(volume_id, None, set(['attached', 'detaching', 'busy']), 60):
+                raise ValueError('Timed out waiting for volume to detach: %s' % volume_id)
+
+        return volume_id
+
+
+FLEXVOLUME_LOG = '/tmp/flex-volume.log'
+
+
+def _log(message_dict):
+    sys.stdout.write(json.dumps(message_dict))
+
+
+def _debug(message):
+    with open(FLEXVOLUME_LOG, mode='a') as log_file:
+        log_file.write('{}: {}\n'.format(datetime.datetime.now(), message))
+
+
+def mount(mount_location, json_parameters):
+    """Mount a volume to this instance, in a mount location corresponding to a Kubernetes pod. This
+    function should be resilient to retries, as Kubelet will keep retrying until the command
+    exits successfully
+
+    Args:
+        mount_location (str): Kubernetes-provided mount location, corresponds to a pod's volume mount
+        json_parameters (str): JSON containing user parameters required for volume creation and attachment
+    """
+    parameters = json.loads(json_parameters)
+    environment_name = parameters['env_name']
+    iops = int(parameters['iops'])
+    storage = int(parameters['storage'])
+    deployment_tag = parameters['deployment_tag']
+    snapshot_id = parameters.get('snapshot_id')
+    volume_id = parameters.get('volume_id')
+
+    volume_manager = VolumeManager()
+
+    instance_id = volume_manager._get_instance_id()
+    if not volume_id:
+        # In case a volume already exists for this environment, possibly from retrying this command,
+        # use that volume ID
+        volume_id = volume_manager._get_volume_id(environment_name=environment_name, snapshot_id=snapshot_id)
+        if volume_id:
+            _debug('Volume {} already exists for environment {}'.format(volume_id, environment_name))
+        else:
+            _debug(
+                'Creating volume for environment {}, iops: {}, storage: {}Gb, deployment_tag: {}, snapshot_id: {}'
+                .format(environment_name, iops, storage, deployment_tag, snapshot_id)
+            )
+            volume_id = volume_manager.create_volume(
+                instance_id, environment_name, iops, storage, deployment_tag, snapshot_id=snapshot_id
+            )
+
+    _debug('Attaching volume {} to instance {} on mount {}'.format(
+        volume_id, instance_id, mount_location)
+    )
+    volume_id = volume_manager.attach_volume(instance_id, volume_id, mount_location)
+
+
+def unmount(mount_location):
+    """
+    Unmounts and detaches an AWS volume from this instance.
+
+    Args:
+        mount_location (str): Kubernetes-provided mount location, corresponds with a pod's volume mount
+    """
+    volume_manager = VolumeManager()
+
+    volume_id = volume_manager.detach_volume(mount_location)
+    if not volume_id:
+        return
+    _debug('Detached volume {}'.format(volume_id))
+
+    _debug('Creating snapshot from volume {}'.format(volume_id))
+    volume_manager.create_snapshot(volume_id)
+
+
+def run_command(command, args):
+    try:
+        command(*args.args)
+    except Exception as e:
+        _debug(traceback.format_exc())
+        _log({'status': 'Failure', 'message': str(e)})
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command')
+    parser.add_argument('args', nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+
+    if args.command == 'init':
+        _log({
+            'status': 'Success',
+            'capabilities': {'attach': False}
+        })
+
+    elif args.command == 'mount':
+        if len(args.args) != 2:
+            _log({
+                'status': 'Failure',
+                'message': 'Incorrect number of arguments. Usage: mount <mount_device> <json_parameters>'
+            })
+            sys.exit(1)
+
+        run_command(mount, args)
+        _log({'status': 'Success'})
+
+    elif args.command == 'unmount':
+        if len(args.args) != 1:
+            _log({'status': 'Failure', 'message': 'Incorrect number of arguments. Usage: mount <mount_device>'})
+            sys.exit(1)
+
+        run_command(unmount, args)
+        _log({'status': 'Success'})
+
+    else:
+        _log({'status': 'Failure', 'message': 'Not supported'})
+
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
